@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>IPv6 → IPv4 Geo Matcher</title>
+<style>
+body{font-family:Arial;margin:0;background:#111;color:#eee;padding:18px}
+.box{max-width:700px;margin:auto}
+input,button{box-sizing:border-box;width:100%;padding:13px;margin:6px 0;border-radius:8px;border:1px solid #555}
+input{background:#222;color:#fff}
+button{background:#fff;color:#111;font-weight:bold;cursor:pointer}
+.card{background:#1d1d1d;padding:14px;margin-top:12px;border-radius:10px}
+.ip{font-family:monospace;font-size:16px;padding:5px 0}
+small{color:#aaa}
+</style>
+</head>
+
+<body>
+<div class="box">
+<h2>IPv6 → IPv4 Geo Matcher</h2>
+
+<input id="ip" placeholder="Masukkan IPv6, contoh 2404:c0:b205:2d1c:6ca6:485e:c9f9:4ab7">
+<button onclick="run()">CARI IPv4</button>
+
+<div id="out"></div>
+</div>
+
+<script>
+const $=x=>document.getElementById(x);
+
+async function get(url){
+  let r=await fetch(url);
+  if(!r.ok)throw Error(r.status);
+  return r.json();
+}
+
+/* Cari data lokasi + ASN IPv6 */
+async function geo(ip){
+  let urls=[
+    "https://ipwho.is/"+encodeURIComponent(ip),
+    "https://ipapi.co/"+encodeURIComponent(ip)+"/json/",
+    "https://api.db-ip.com/v2/free/"+encodeURIComponent(ip)
+  ];
+
+  for(let u of urls){
+    try{
+      let x=await get(u);
+
+      let city=x.city||x.location?.city||"";
+      let state=x.region||x.regionName||x.location?.state||"";
+      let country=x.country||x.country_name||"";
+      let asn=x.connection?.asn||x.asn||x.org?.match(/AS\d+/)?.[0]||"";
+      let isp=x.connection?.org||x.org||"";
+
+      if(city||state||asn)
+        return {city,state,country,asn,isp};
+    }catch(e){}
+  }
+  return null;
+}
+
+/* Ambil IPv4 prefix yang berasal dari ASN */
+async function prefixes(asn){
+  let n=asn.replace(/^AS/i,"");
+
+  let u=
+  "https://stat.ripe.net/data/ris-prefixes/data.json"+
+  "?resource=AS"+encodeURIComponent(n)+
+  "&list_prefixes=true&types=o&af=v4&noise=filter";
+
+  let x=await get(u);
+  let p=x?.data?.prefixes||[];
+
+  return p.map(v=>typeof v=="string"?v:v.prefix||"")
+          .filter(v=>/^\d+\.\d+\.\d+\.\d+\/\d+$/.test(v));
+}
+
+/* Ambil beberapa IP dari sebuah prefix */
+function samples(p){
+  let [a,b]=p.split("/");
+  let q=a.split(".").map(Number);
+  let base=(q[0]<<24)|(q[1]<<16)|(q[2]<<8)|q[3];
+  let size=2**(32-Number(b));
+
+  let nums=[
+    base+1,
+    base+Math.floor(size/4),
+    base+Math.floor(size/2),
+    base+Math.floor(size*3/4)
+  ];
+
+  return [...new Set(nums)]
+    .filter(n=>n>0 && n<4294967295)
+    .map(n=>[
+      (n>>>24)&255,
+      (n>>>16)&255,
+      (n>>>8)&255,
+      n&255
+    ].join("."));
+}
+
+/* GeoIP IPv4 */
+async function geo4(ip){
+  let urls=[
+    "https://ipwho.is/"+ip,
+    "https://ipapi.co/"+ip+"/json/",
+    "https://api.db-ip.com/v2/free/"+ip
+  ];
+
+  for(let u of urls){
+    try{
+      let x=await get(u);
+
+      let city=x.city||x.location?.city||"";
+      let state=x.region||x.regionName||x.location?.state||"";
+      let country=x.country||x.country_name||"";
+      let asn=x.connection?.asn||x.asn||x.org?.match(/AS\d+/)?.[0]||"";
+
+      if(city||state||asn)
+        return {city,state,country,asn};
+    }catch(e){}
+  }
+  return null;
+}
+
+async function run(){
+  let ip=$("ip").value.trim();
+  let out=$("out");
+
+  if(!ip){
+    out.innerHTML="<div class=card>Masukkan IPv6 dulu.</div>";
+    return;
+  }
+
+  out.innerHTML="<div class=card>Mendeteksi IPv6...</div>";
+
+  try{
+    let g=await geo(ip);
+
+    if(!g){
+      out.innerHTML="<div class=card>GeoIP IPv6 gagal dibaca.</div>";
+      return;
+    }
+
+    if(!g.asn){
+      out.innerHTML="<div class=card>ASN IPv6 tidak ditemukan.</div>";
+      return;
+    }
+
+    out.innerHTML=`
+    <div class=card>
+    <b>Target IPv6</b><br>
+    ${ip}<br><br>
+    <b>City:</b> ${g.city||"-"}<br>
+    <b>State:</b> ${g.state||"-"}<br>
+    <b>Country:</b> ${g.country||"-"}<br>
+    <b>ASN:</b> ${g.asn}<br>
+    <b>ISP:</b> ${g.isp||"-"}
+    </div>
+    <div class=card>Mencari prefix IPv4 AS ${g.asn}...</div>`;
+
+    let ps=await prefixes(g.asn);
+
+    if(!ps.length){
+      out.innerHTML+=
+      "<div class=card>Tidak menemukan prefix IPv4 dari RIPEstat.</div>";
+      return;
+    }
+
+    let results=[];
+    let checked=0;
+
+    /*
+      Batasi prefix supaya browser HP tidak melakukan
+      ratusan request sekaligus.
+    */
+    for(let p of ps){
+      if(results.length>=20)break;
+
+      for(let v4 of samples(p)){
+        if(results.length>=20)break;
+
+        checked++;
+
+        let x=await geo4(v4);
+        if(!x)continue;
+
+        let sameASN=
+          !x.asn ||
+          x.asn.toUpperCase()==g.asn.toUpperCase();
+
+        let sameCity=
+          g.city && x.city &&
+          x.city.toLowerCase()==g.city.toLowerCase();
+
+        let sameState=
+          g.state && x.state &&
+          x.state.toLowerCase()==g.state.toLowerCase();
+
+        let sameCountry=
+          g.country && x.country &&
+          x.country.toLowerCase()==g.country.toLowerCase();
+
+        /*
+          Prioritas:
+          1. City + State + Country + ASN
+          2. State + Country + ASN
+          3. Country + ASN
+        */
+        let score=0;
+
+        if(sameCountry)score+=1;
+        if(sameState)score+=2;
+        if(sameCity)score+=4;
+        if(sameASN)score+=8;
+
+        if(score>=15){
+          results.push({
+            ip:v4,
+            prefix:p,
+            city:x.city,
+            state:x.state,
+            country:x.country,
+            asn:x.asn,
+            score
+          });
+        }
+
+        out.querySelectorAll(".progress").forEach(e=>
+          e.innerText="Diperiksa: "+checked+
+          " IP | ditemukan: "+results.length
+        );
+      }
+    }
+
+    results.sort((a,b)=>b.score-a.score);
+
+    let html=`
+    <div class=card>
+    <b>Hasil IPv4</b><br>
+    <small>ASN ${g.asn} • ${g.city||"-"}, ${g.state||"-"}, ${g.country||"-"}</small>
+    </div>
+    <div class=card><span class=progress>
+    Diperiksa: ${checked} IP | ditemukan: ${results.length}
+    </span></div>`;
+
+    if(!results.length){
+      html+=`
+      <div class=card>
+      Tidak menemukan IPv4 yang cocok pada sample prefix yang diperiksa.
+      <br><br>
+      Ini bukan berarti ASN tersebut tidak mempunyai IPv4 di kota itu;
+      database GeoIP antar-provider bisa berbeda.
+      </div>`;
+    }else{
+      results.forEach((r,i)=>{
+        html+=`
+        <div class=card>
+        <div class=ip>${i+1}. ${r.ip}</div>
+        <small>
+        Prefix: ${r.prefix}<br>
+        City: ${r.city||"-"}<br>
+        State: ${r.state||"-"}<br>
+        Country: ${r.country||"-"}<br>
+        ASN: ${r.asn||"-"}
+        </small>
+        </div>`;
+      });
+    }
+
+    out.innerHTML+=html;
+
+  }catch(e){
+    out.innerHTML+=
+    "<div class=card>Gagal mengambil data: "+e.message+"</div>";
+  }
+}
+</script>
+</body>
+</html>
